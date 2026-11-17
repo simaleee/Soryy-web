@@ -1,0 +1,80 @@
+name: Publish verified WebGL
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        required: true
+        type: string
+      name:
+        required: true
+        type: string
+      sha256:
+        required: true
+        type: string
+      size:
+        required: true
+        type: string
+      parts:
+        required: true
+        type: string
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: web-release
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Assemble and verify built game
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          WEB_TAG: ${{ inputs.tag }}
+          WEB_NAME: ${{ inputs.name }}
+          WEB_SHA: ${{ inputs.sha256 }}
+          WEB_SIZE: ${{ inputs.size }}
+          WEB_PARTS: ${{ inputs.parts }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, shutil, subprocess, zipfile
+          repo = os.environ['GH_REPO']
+          tag, name, expected = [os.environ[k] for k in ['WEB_TAG','WEB_NAME','WEB_SHA']]
+          assert re.fullmatch(r'web-v[0-9]+[.][0-9]+[.][0-9]+', tag)
+          assert re.fullmatch(r'Soryy-web-[0-9.]+[.]zip', name)
+          assert re.fullmatch(r'[0-9a-f]{64}', expected)
+          size, count = int(os.environ['WEB_SIZE']), int(os.environ['WEB_PARTS'])
+          assert 0 < size < 2100000000 and 0 < count < 200
+          release = json.loads(subprocess.check_output(['gh','api',f'repos/{repo}/releases/tags/{tag}']))
+          parts = sorted((a for a in release['assets'] if re.fullmatch(re.escape(name)+r'[.]part[0-9]{3}',a['name'])),key=lambda a:a['name'])
+          assert len(parts) == count
+          target = pathlib.Path(name)
+          with target.open('wb') as output:
+              for index, asset in enumerate(parts):
+                  assert asset['name'] == name + f'.part{index:03}' and asset['state'] == 'uploaded'
+                  chunk = pathlib.Path('part.tmp')
+                  with chunk.open('wb') as stream:
+                      subprocess.run(['curl','--fail','--silent','--show-error','--location','--retry','3','--config','-','--header','Accept: application/octet-stream',asset['url']],input='header = "Authorization: Bearer '+os.environ['GH_TOKEN']+'"'+chr(10),text=True,stdout=stream,check=True)
+                  assert chunk.stat().st_size == asset['size']
+                  with chunk.open('rb') as stream: shutil.copyfileobj(stream,output)
+          with target.open('rb') as stream: assert hashlib.file_digest(stream,'sha256').hexdigest() == expected
+          assert target.stat().st_size == size
+          root = pathlib.Path('web').resolve()
+          with zipfile.ZipFile(target) as archive:
+              assert archive.testzip() is None
+              assert all((root/item.filename).resolve().is_relative_to(root) for item in archive.infolist())
+              archive.extractall(root)
+          assert (root/'index.html').is_file() and (root/'Build').is_dir()
+          PY
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: web
+      - uses: actions/deploy-pages@v4
+        id: deployment
